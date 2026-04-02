@@ -664,6 +664,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             weight_decay=self.weight_decay,
             checkpoint_path=checkpoint_path,
             device=self.device,
+            optimizer_name=getattr(self, "optimizer_name", "adamw"),
         )
 
         use_amp = self.device.startswith("cuda") and torch.cuda.is_available()

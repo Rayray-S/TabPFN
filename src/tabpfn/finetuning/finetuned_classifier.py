@@ -15,7 +15,7 @@ from typing_extensions import override
 import numpy as np
 import torch
 from sklearn.base import ClassifierMixin
-from sklearn.metrics import log_loss, roc_auc_score
+from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 from sklearn.utils.validation import check_is_fitted
 
 from tabpfn import TabPFNClassifier
@@ -34,8 +34,11 @@ def _compute_classification_loss(
     *,
     logits_BLQ: torch.Tensor,
     targets_BQ: torch.Tensor,
+    loss_type: Literal["ce", "weighted_ce", "focal"] = "ce",
+    focal_gamma: float = 2.0,
+    weight_clamp_max: float = 50.0,
 ) -> torch.Tensor:
-    """Compute the cross-entropy training loss.
+    """Compute the (optionally cost-sensitive) classification training loss.
 
     Shapes suffixes:
         B=batch * estimators, L=logits, Q=n_queries.
@@ -43,11 +46,65 @@ def _compute_classification_loss(
     Args:
         logits_BLQ: Raw logits of shape (B*E, L, Q).
         targets_BQ: Integer class targets of shape (B*E, Q).
+        loss_type:
+            - ``"ce"``: standard cross-entropy.
+            - ``"weighted_ce"``: inverse-frequency class weighted cross-entropy.
+            - ``"focal"``: focal loss with alpha derived from inverse-frequency weights.
+        focal_gamma: Focal loss focusing parameter (>= 0).
+        weight_clamp_max: Clamp max class weight for stability.
 
     Returns:
         A scalar loss tensor.
     """
-    return torch.nn.functional.cross_entropy(logits_BLQ, targets_BQ)
+    import torch.nn.functional as F
+
+    if loss_type == "ce":
+        return F.cross_entropy(logits_BLQ, targets_BQ)
+
+    if focal_gamma < 0:
+        raise ValueError(f"focal_gamma must be >= 0, got {focal_gamma}")
+
+    # Build inverse-frequency class weights from the current batch/query targets.
+    # Note: targets_BQ are integer-encoded class indices.
+    targets = targets_BQ.long()
+    n_classes = logits_BLQ.shape[1]
+    targets_flat = targets.reshape(-1)
+    counts = torch.bincount(targets_flat.detach().cpu(), minlength=n_classes).to(
+        device=targets.device
+    )
+    total = counts.sum().clamp_min(1)
+
+    # For missing classes in this batch, set weight to 0 (so they don't contribute).
+    counts_safe = torch.where(counts > 0, counts, torch.ones_like(counts))
+    inv_freq = total / (n_classes * counts_safe)
+    weights = torch.where(counts > 0, inv_freq, torch.zeros_like(inv_freq))
+
+    present = weights > 0
+    if bool(present.any()):
+        # Normalize weights so the mean weight of present classes is ~1.
+        weights = weights / weights[present].mean()
+
+    weights = weights.clamp_max(weight_clamp_max)
+    weights = weights.to(device=logits_BLQ.device, dtype=logits_BLQ.dtype)
+
+    if loss_type == "weighted_ce":
+        return F.cross_entropy(logits_BLQ, targets, weight=weights)
+
+    if loss_type != "focal":
+        raise ValueError(f"Unknown loss_type={loss_type!r}")
+
+    # Focal loss (multi-class) with class-wise alpha.
+    log_probs = F.log_softmax(logits_BLQ, dim=1)  # (B*E, C, Q)
+    target_log_probs = log_probs.gather(
+        dim=1, index=targets.unsqueeze(1)
+    ).squeeze(1)  # (B*E, Q)
+    p_t = target_log_probs.exp()
+    focal_factor = (1.0 - p_t).pow(focal_gamma)
+    loss = -focal_factor * target_log_probs
+
+    alpha_t = weights[targets]  # (B*E, Q)
+    loss = alpha_t * loss
+    return loss.mean()
 
 
 class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
@@ -152,7 +209,21 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         save_checkpoint_interval: int | None = 10,
         use_fixed_preprocessing_seed: bool = True,
         extra_classifier_kwargs: dict[str, Any] | None = None,
-        eval_metric: Literal["roc_auc", "log_loss"] | None = None,
+        # Inference-time post-processing knobs (used in the final fitted estimator).
+        average_before_softmax: bool | None = None,
+        balance_probabilities: bool | None = None,
+        # Optimizer choice for fine-tuning.
+        optimizer_name: Literal["adamw", "adam", "rmsprop"] = "adamw",
+        loss_type: Literal["ce", "weighted_ce", "focal"] = "ce",
+        focal_gamma: float = 2.0,
+        weight_clamp_max: float = 50.0,
+        eval_metric: Literal[
+            "roc_auc",
+            "log_loss",
+            "auprc",
+            "precision_at_1pct",
+        ]
+        | None = None,
     ):
         super().__init__(
             device=device,
@@ -178,8 +249,17 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             save_checkpoint_interval=save_checkpoint_interval,
             use_fixed_preprocessing_seed=use_fixed_preprocessing_seed,
         )
+        extra_classifier_kwargs = extra_classifier_kwargs or {}
+        if average_before_softmax is not None:
+            extra_classifier_kwargs["average_before_softmax"] = average_before_softmax
+        if balance_probabilities is not None:
+            extra_classifier_kwargs["balance_probabilities"] = balance_probabilities
         self.extra_classifier_kwargs = extra_classifier_kwargs
+        self.loss_type = loss_type
+        self.focal_gamma = focal_gamma
+        self.weight_clamp_max = weight_clamp_max
         self.eval_metric = eval_metric
+        self.optimizer_name = optimizer_name
 
     @property
     @override
@@ -197,7 +277,16 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
     @override
     def _metric_name(self) -> str:
         """Return the name of the primary metric."""
-        return "ROC AUC"
+        metric = self.eval_metric or "roc_auc"
+        if metric == "roc_auc":
+            return "ROC AUC"
+        if metric == "log_loss":
+            return "Log Loss"
+        if metric == "auprc":
+            return "AUPRC"
+        if metric == "precision_at_1pct":
+            return "Precision@1%"
+        return str(metric)
 
     @override
     def _create_estimator(self, config: dict[str, Any]) -> TabPFNClassifier:
@@ -278,6 +367,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         return _compute_classification_loss(
             logits_BLQ=logits_BLQ,
             targets_BQ=targets_BQ,
+            loss_type=self.loss_type,
+            focal_gamma=self.focal_gamma,
+            weight_clamp_max=self.weight_clamp_max,
         )
 
     @override
@@ -299,25 +391,61 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
 
         try:
             probabilities = eval_classifier.predict_proba(X_val)  # type: ignore
+
             if probabilities.shape[1] > 2:
                 roc_auc = roc_auc_score(y_val, probabilities, multi_class="ovr")
             else:
                 roc_auc = roc_auc_score(y_val, probabilities[:, 1])
             log_loss_score = log_loss(y_val, probabilities)
+
+            # Fraud detection is binary in our use-case; implement Top-k metrics
+            # consistently with the user's external definition: sort by score and take
+            # Top ceil(n*0.01).
+            precision_at_1pct = np.nan
+            sensitivity_at_1pct = np.nan
+            auprc = np.nan
+
+            scores = probabilities[:, 1] if probabilities.shape[1] > 1 else probabilities[:, 0]
+            unique_labels = np.unique(y_val)
+            if len(unique_labels) == 2:
+                pos_label = 1 if 1 in unique_labels else unique_labels.max()
+                y_bin = (y_val == pos_label).astype(int)
+                auprc = average_precision_score(y_bin, scores)
+
+                k = max(1, int(np.ceil(len(y_bin) * 0.01)))
+                order = np.argsort(-scores)
+                top_idx = order[:k]
+                capture = int(y_bin[top_idx].sum())
+                total_pos = int(y_bin.sum())
+                precision_at_1pct = capture / k
+                sensitivity_at_1pct = capture / total_pos if total_pos > 0 else 0.0
         except (ValueError, RuntimeError, AttributeError) as e:
             logger.warning(f"An error occurred during evaluation: {e}")
             roc_auc, log_loss_score = np.nan, np.nan
+            precision_at_1pct = np.nan
+            sensitivity_at_1pct = np.nan
+            auprc = np.nan
 
         if self.eval_metric == "roc_auc":
             primary_metric = roc_auc
         elif self.eval_metric == "log_loss":
             primary_metric = -log_loss_score
+        elif self.eval_metric == "auprc":
+            primary_metric = auprc
+        elif self.eval_metric == "precision_at_1pct":
+            primary_metric = precision_at_1pct
         else:
             raise ValueError(f"Unsupported eval_metric: {self.eval_metric}")
 
         return EvalResult(
             primary=primary_metric,  # pyright: ignore[reportArgumentType]
-            secondary={"log_loss": log_loss_score, "roc_auc": roc_auc},
+            secondary={
+                "log_loss": log_loss_score,
+                "roc_auc": roc_auc,
+                "auprc": auprc,
+                "precision_at_1pct": precision_at_1pct,
+                "sensitivity_at_1pct": sensitivity_at_1pct,
+            },
         )
 
     @override
@@ -337,6 +465,13 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             "primary_metric": eval_result.primary,
             "log_loss": eval_result.secondary.get("log_loss", np.nan),
             "roc_auc": eval_result.secondary.get("roc_auc", np.nan),
+            "auprc": eval_result.secondary.get("auprc", np.nan),
+            "precision_at_1pct": eval_result.secondary.get(
+                "precision_at_1pct", np.nan
+            ),
+            "sensitivity_at_1pct": eval_result.secondary.get(
+                "sensitivity_at_1pct", np.nan
+            ),
         }
 
     @override

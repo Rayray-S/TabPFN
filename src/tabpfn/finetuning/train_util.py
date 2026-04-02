@@ -7,10 +7,10 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Literal
 
 import torch
-from torch.optim import AdamW
+from torch.optim import Adam, AdamW, RMSprop
 
 from tabpfn import TabPFNClassifier, TabPFNRegressor
 from tabpfn.base import ClassifierModelSpecs, RegressorModelSpecs
@@ -234,8 +234,9 @@ def get_and_init_optimizer(
     weight_decay: float,
     checkpoint_path: Path | None = None,
     device: str = "cpu",
-) -> AdamW:
-    """Create and initialize AdamW optimizer, optionally loading from checkpoint.
+    optimizer_name: Literal["adamw", "adam", "rmsprop"] = "adamw",
+) -> torch.optim.Optimizer:
+    """Create and initialize an optimizer, optionally loading from checkpoint.
 
     Args:
         model_parameters: Iterator of model parameters to optimize.
@@ -244,15 +245,23 @@ def get_and_init_optimizer(
         checkpoint_path: Path to checkpoint file containing optimizer state.
             If provided, loads optimizer state from this checkpoint.
         device: Device to load the optimizer state from.
+        optimizer_name: Which optimizer to use.
 
     Returns:
-        Initialized AdamW optimizer.
+        Initialized optimizer instance.
     """
-    optimizer = AdamW(
-        model_parameters,
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
+    if optimizer_name == "adamw":
+        optimizer = AdamW(model_parameters, lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "adam":
+        optimizer = Adam(model_parameters, lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "rmsprop":
+        optimizer = RMSprop(
+            model_parameters,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer_name={optimizer_name!r}")
 
     if checkpoint_path is not None:
         checkpoint = torch.load(
