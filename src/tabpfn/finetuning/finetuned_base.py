@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import torch
 import torch.distributed as dist
+import wandb
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import train_test_split
 from torch.nn.parallel import DistributedDataParallel
@@ -265,6 +266,11 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         use_activation_checkpointing: bool = True,
         save_checkpoint_interval: int | None = 10,
         use_fixed_preprocessing_seed: bool = True,
+        wandb_project: str | None = None,
+        wandb_run_name: str | None = None,
+        wandb_tags: list[str] | None = None,
+        wandb_config: dict[str, Any] | None = None,
+        wandb_mode: Literal["online", "offline", "disabled"] = "online",
     ):
         super().__init__()
         self.device = device
@@ -290,6 +296,12 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         self.save_checkpoint_interval = save_checkpoint_interval
         self.meta_batch_size = META_BATCH_SIZE
         self.use_fixed_preprocessing_seed = use_fixed_preprocessing_seed
+        self.wandb_project = wandb_project
+        self.wandb_run_name = wandb_run_name
+        self.wandb_tags = wandb_tags
+        self.wandb_config = wandb_config or {}
+        self.wandb_mode = wandb_mode
+        self._wandb_run = None
         self._ddp_module_: DistributedDataParallel | None = None
 
         if self.use_fixed_preprocessing_seed and not (
@@ -306,6 +318,85 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 UserWarning,
                 stacklevel=2,
             )
+
+    def _wandb_is_enabled(self) -> bool:
+        """Return whether W&B logging should be active."""
+        return self.wandb_mode != "disabled" and self.wandb_project is not None
+
+    def _sanitize_wandb_value(self, value: Any) -> Any:
+        """Convert values to W&B-safe primitives recursively."""
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, torch.device):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): self._sanitize_wandb_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._sanitize_wandb_value(v) for v in value]
+        return str(value)
+
+    def _get_wandb_config(self, output_dir: Path | None) -> dict[str, Any]:
+        """Collect run configuration for W&B."""
+        config = {
+            "device": self.device,
+            "epochs": self.epochs,
+            "time_limit": self.time_limit,
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "validation_split_ratio": self.validation_split_ratio,
+            "n_finetune_ctx_plus_query_samples": self.n_finetune_ctx_plus_query_samples,
+            "finetune_ctx_query_split_ratio": self.finetune_ctx_query_split_ratio,
+            "n_inference_subsample_samples": self.n_inference_subsample_samples,
+            "random_state": self.random_state,
+            "early_stopping": self.early_stopping,
+            "early_stopping_patience": self.early_stopping_patience,
+            "min_delta": self.min_delta,
+            "grad_clip_value": self.grad_clip_value,
+            "use_lr_scheduler": self.use_lr_scheduler,
+            "lr_warmup_only": self.lr_warmup_only,
+            "n_estimators_finetune": self.n_estimators_finetune,
+            "n_estimators_validation": self.n_estimators_validation,
+            "n_estimators_final_inference": self.n_estimators_final_inference,
+            "use_activation_checkpointing": self.use_activation_checkpointing,
+            "save_checkpoint_interval": self.save_checkpoint_interval,
+            "use_fixed_preprocessing_seed": self.use_fixed_preprocessing_seed,
+            "output_dir": str(output_dir) if output_dir is not None else None,
+            "estimator_kwargs": self._estimator_kwargs,
+            "model_type": self._model_type,
+            "metric_name": self._metric_name,
+        }
+        config.update(self.wandb_config)
+        return self._sanitize_wandb_value(config)
+
+    def _init_wandb_run(self, output_dir: Path | None) -> None:
+        """Initialize the W&B run on the main process."""
+        if not self._wandb_is_enabled():
+            return
+        self._wandb_run = wandb.init(
+            project=self.wandb_project,
+            name=self.wandb_run_name,
+            tags=self.wandb_tags,
+            config=self._get_wandb_config(output_dir),
+            mode=self.wandb_mode,
+            reinit=True,
+        )
+
+    def _log_wandb_metrics(self, metrics: dict[str, Any], *, step: int | None = None) -> None:
+        """Log metrics to W&B if enabled."""
+        if self._wandb_run is not None:
+            wandb.log(self._sanitize_wandb_value(metrics), step=step)
+
+    def _finish_wandb_run(self) -> None:
+        """Close the W&B run if one was opened."""
+        if self._wandb_run is not None:
+            self._wandb_run.finish()
+            self._wandb_run = None
 
     def _build_estimator_config(
         self,
@@ -549,6 +640,9 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         if using_ddp:
             self.device = device_str
 
+        if is_main_process:
+            self._init_wandb_run(output_dir)
+
         # Store the original training size for checkpoint naming
         train_size = X.shape[0]
         start_time = time.monotonic()
@@ -696,6 +790,16 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 y_val,  # pyright: ignore[reportArgumentType]
             )
             self._log_epoch_evaluation(-1, eval_result, mean_train_loss=None)
+            self._log_wandb_metrics(
+                {
+                    "epoch": 0,
+                    "train/loss": None,
+                    "val/primary_metric": eval_result.primary,
+                    "val/best_primary_metric": eval_result.primary,
+                    **{f"val/{k}": v for k, v in eval_result.secondary.items()},
+                },
+                step=0,
+            )
             best_metric: float = eval_result.primary
         else:
             best_metric = self._get_initial_best_metric()
@@ -901,6 +1005,16 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                     y_val,  # pyright: ignore[reportArgumentType]
                 )
                 self._log_epoch_evaluation(epoch, eval_result, mean_train_loss)
+                self._log_wandb_metrics(
+                    {
+                        "epoch": epoch + 1,
+                        "train/loss": mean_train_loss,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "val/primary_metric": eval_result.primary,
+                        **{f"val/{k}": v for k, v in eval_result.secondary.items()},
+                    },
+                    step=epoch + 1,
+                )
                 primary_metric = eval_result.primary
             else:
                 primary_metric = self._get_initial_best_metric()
@@ -935,6 +1049,14 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             if self.early_stopping and not np.isnan(primary_metric):
                 if self._is_improvement(primary_metric, best_metric):
                     best_metric = primary_metric
+                    if is_main_process:
+                        self._log_wandb_metrics(
+                            {
+                                "val/best_primary_metric": best_metric,
+                                "train/patience_counter": 0,
+                            },
+                            step=epoch + 1,
+                        )
                     patience_counter = 0
                     model_sd = self.finetuned_estimator_.model_.state_dict()
                     best_model_state = {
@@ -943,6 +1065,13 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 else:
                     patience_counter += 1
                     if is_main_process:
+                        self._log_wandb_metrics(
+                            {
+                                "val/best_primary_metric": best_metric,
+                                "train/patience_counter": patience_counter,
+                            },
+                            step=epoch + 1,
+                        )
                         logger.info(
                             "⚠️  No improvement for %s epochs. Best %s: %.4f",
                             patience_counter,
@@ -993,6 +1122,15 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 dist.destroy_process_group()
 
         if is_main_process:
+            self._log_wandb_metrics(
+                {
+                    "summary/best_primary_metric": best_metric,
+                    "summary/epochs_completed": epoch + 1 if 'epoch' in locals() else 0,
+                    "summary/train_size": train_size,
+                    "summary/val_size": len(y_val),
+                }
+            )
+            self._finish_wandb_run()
             logger.info("--- ✅ Fine-tuning Finished ---")
 
         if is_main_process:

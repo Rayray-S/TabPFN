@@ -208,6 +208,11 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         use_activation_checkpointing: bool = True,
         save_checkpoint_interval: int | None = 10,
         use_fixed_preprocessing_seed: bool = True,
+        wandb_project: str | None = None,
+        wandb_run_name: str | None = None,
+        wandb_tags: list[str] | None = None,
+        wandb_config: dict[str, Any] | None = None,
+        wandb_mode: Literal["online", "offline", "disabled"] = "online",
         extra_classifier_kwargs: dict[str, Any] | None = None,
         # Inference-time post-processing knobs (used in the final fitted estimator).
         average_before_softmax: bool | None = None,
@@ -248,6 +253,11 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             use_activation_checkpointing=use_activation_checkpointing,
             save_checkpoint_interval=save_checkpoint_interval,
             use_fixed_preprocessing_seed=use_fixed_preprocessing_seed,
+            wandb_project=wandb_project,
+            wandb_run_name=wandb_run_name,
+            wandb_tags=wandb_tags,
+            wandb_config=wandb_config,
+            wandb_mode=wandb_mode,
         )
         extra_classifier_kwargs = extra_classifier_kwargs or {}
         if average_before_softmax is not None:
